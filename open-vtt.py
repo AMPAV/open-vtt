@@ -12,12 +12,15 @@ import argparse
 import datetime
 import http.server
 import json
+import mimetypes
 import os
 import platform
+import re
 import shutil
 import socketserver
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple
@@ -41,7 +44,13 @@ def load_config():
     """Load configuration from config.json with sensible defaults."""
     config = {
         "gemini": {
-            "model": "gemini-3-pro-preview",
+            "backend": "auto",
+            "project": None,
+            "location": "global",
+            "model": "gemini-3.1-pro-preview",
+            "gcs_bucket": None,
+            "gcs_prefix": "open-vtt/staging",
+            "inline_max_size_mb": 15,
             "temperature": 0.7,
             "max_output_tokens": 65536,
             "thinking": "high",
@@ -57,7 +66,8 @@ def load_config():
             ]
         },
         "transcription": {
-            "language": "en"  # Whisper language code: en, de, fr, es, etc.
+            "language": "en",  # Whisper language code: en, de, fr, es, etc.
+            "model": "base",
         },
         "files": {
             "prompt": str(BASE_DIR / "prompts/gemini_vtt_prompt.md")
@@ -98,6 +108,20 @@ PROMPT_FILE = CONFIG["files"]["prompt"]
 HAS_MLX_WHISPER = False
 HAS_WHISPER = False
 HAS_GENAI = False
+HAS_PYAV = False
+HAS_GCS = False
+
+try:
+    import av
+    HAS_PYAV = True
+except ImportError:
+    pass
+
+try:
+    from google.cloud import storage
+    HAS_GCS = True
+except ImportError:
+    pass
 
 try:
     import mlx_whisper
@@ -115,14 +139,8 @@ try:
     from google import genai
     from google.genai import types
     HAS_GENAI = True
-    GENAI_NEW = True
 except ImportError:
-    try:
-        import google.generativeai as genai
-        HAS_GENAI = True
-        GENAI_NEW = False
-    except ImportError:
-        pass
+    pass
 
 # =============================================================================
 # UTILITIES
@@ -205,38 +223,117 @@ def to_vtt_time(seconds: float) -> str:
 
 
 # =============================================================================
-# API KEY HANDLING
+# GEMINI AUTHENTICATION AND GOOGLE CLOUD CONFIGURATION
 # =============================================================================
 
 def get_api_key() -> Optional[str]:
-    """Get Gemini API key from environment or secrets.json."""
-    # 1. Check environment variable
+    """Return a Gemini Developer API key from the environment or secrets file."""
     key = os.environ.get("GEMINI_API_KEY")
     if key:
-        log_info("Using GEMINI_API_KEY from environment")
         return key
-    
-    # 2. Check secrets.json
+
     secrets_path = BASE_DIR / "secrets.json"
     if secrets_path.exists():
         try:
             with open(secrets_path) as f:
-                secrets = json.load(f)
-                key = secrets.get("GEMINI_API_KEY")
-                if key and not key.startswith("YOUR_"):
-                    log_info("Using GEMINI_API_KEY from secrets.json")
-                    return key
-        except json.JSONDecodeError:
+                key = json.load(f).get("GEMINI_API_KEY")
+            if key and not key.startswith("YOUR_"):
+                return key
+        except (json.JSONDecodeError, IOError):
             log_warning("secrets.json is not valid JSON")
-    
     return None
+
+
+def get_gcp_project() -> Optional[str]:
+    """Return the Vertex AI project from the environment or config."""
+    return os.environ.get("GOOGLE_CLOUD_PROJECT") or CONFIG["gemini"].get("project")
+
+
+def get_gcp_location() -> str:
+    """Return the Vertex AI location from the environment or config."""
+    return (
+        os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or CONFIG["gemini"].get("location")
+        or "global"
+    )
+
+
+def get_gcs_bucket() -> Optional[str]:
+    """Return the optional GCS staging bucket for the Vertex backend."""
+    return os.environ.get("OPEN_VTT_GCS_BUCKET") or CONFIG["gemini"].get("gcs_bucket")
+
+
+def get_gcs_prefix() -> str:
+    """Return the object prefix used for tool-owned temporary media."""
+    return (
+        os.environ.get("OPEN_VTT_GCS_PREFIX")
+        or CONFIG["gemini"].get("gcs_prefix")
+        or "open-vtt/staging"
+    ).strip("/")
+
+
+def resolve_gemini_backend(api_key: Optional[str] = None) -> str:
+    """Resolve ``developer`` or ``vertex`` from config and available auth."""
+    configured = (
+        os.environ.get("OPEN_VTT_GEMINI_BACKEND")
+        or CONFIG["gemini"].get("backend")
+        or "auto"
+    ).lower()
+    if configured not in {"auto", "developer", "vertex"}:
+        raise ValueError("gemini.backend must be auto, developer, or vertex")
+    if configured == "auto":
+        return "developer" if api_key else "vertex"
+    if configured == "developer" and not api_key:
+        raise ValueError("Gemini Developer API backend requires GEMINI_API_KEY")
+    return configured
+
+
+def create_gemini_client(backend: str, api_key: Optional[str] = None):
+    """Create a Gemini client for the selected authentication backend."""
+    if backend == "developer":
+        if not api_key:
+            raise ValueError("Gemini Developer API backend requires GEMINI_API_KEY")
+        return genai.Client(api_key=api_key)
+
+    project = get_gcp_project()
+    if not project:
+        raise ValueError(
+            "Vertex backend requires GOOGLE_CLOUD_PROJECT or gemini.project"
+        )
+    return genai.Client(vertexai=True, project=project, location=get_gcp_location())
+
+
+def normalize_bucket_name(value: str) -> str:
+    """Accept a bucket name or bucket-only ``gs://`` URI."""
+    bucket = value.strip()
+    if bucket.startswith("gs://"):
+        bucket = bucket[5:].rstrip("/")
+    if not bucket or "/" in bucket:
+        raise ValueError("GCS staging bucket must be a name or bucket-only gs:// URI")
+    return bucket
+
+
+def upload_media_to_gcs(video_path: Path, mime_type: str, storage_client) -> tuple:
+    """Upload tool-owned temporary media and return its URI and object location."""
+    bucket_name = normalize_bucket_name(get_gcs_bucket() or "")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", video_path.name).strip("-._")
+    safe_name = safe_name or "media"
+    object_name = "/".join(
+        part for part in (
+            get_gcs_prefix(),
+            f"open-vtt-{uuid.uuid4().hex}-{safe_name}",
+        ) if part
+    )
+    blob = storage_client.bucket(bucket_name).blob(object_name)
+    blob.upload_from_filename(str(video_path), content_type=mime_type)
+    return f"gs://{bucket_name}/{object_name}", bucket_name, object_name
 
 
 # =============================================================================
 # CHECK MODE
 # =============================================================================
 
-def check_command(name: str, cmd: list) -> bool:
+def check_command(name: str, cmd: list, *, required: bool = True) -> bool:
     """Check if a command is available."""
     code, stdout, stderr = run_command(cmd)
     if code == 0:
@@ -245,7 +342,10 @@ def check_command(name: str, cmd: list) -> bool:
         log_success(f"{name}: {version}")
         return True
     else:
-        log_error(f"{name}: not found")
+        if required:
+            log_error(f"{name}: not found")
+        else:
+            log_warning(f"{name}: not found")
         return False
 
 
@@ -255,9 +355,24 @@ def cmd_check():
     
     all_ok = True
     
-    # FFmpeg/FFprobe
-    all_ok &= check_command("ffmpeg", ["ffmpeg", "-version"])
-    all_ok &= check_command("ffprobe", ["ffprobe", "-version"])
+    # FFmpeg is preferred throughout the upstream pipeline. PyAV only covers
+    # probing and Whisper decoding when the command-line tools are absent.
+    ffmpeg_available = check_command(
+        "ffmpeg", ["ffmpeg", "-version"], required=False
+    )
+    ffprobe_available = check_command(
+        "ffprobe", ["ffprobe", "-version"], required=False
+    )
+    if not ffprobe_available and HAS_PYAV:
+        log_warning("PyAV fallback: available for media probing")
+    elif not ffprobe_available:
+        log_error("Media probing requires ffprobe or PyAV (pip install av)")
+        all_ok = False
+    if not ffmpeg_available:
+        log_warning(
+            "ffmpeg is unavailable; PyAV can decode Whisper audio, but embedded "
+            "subtitle extraction and video downsampling will not work"
+        )
     
     # Whisper
     if HAS_MLX_WHISPER:
@@ -270,19 +385,47 @@ def cmd_check():
     
     # Gemini SDK
     if HAS_GENAI:
-        if GENAI_NEW:
-            log_success("google-genai: available (new SDK)")
-        else:
-            log_warning("google-generativeai: available (legacy, recommend google-genai)")
+        log_success("google-genai: available")
     else:
         log_error("google-genai: not installed (pip install google-genai)")
         all_ok = False
-    
-    # API Key
-    if get_api_key():
+
+    api_key = get_api_key()
+    try:
+        backend = resolve_gemini_backend(api_key)
+        log_success(f"Gemini backend: {backend}")
+    except ValueError as error:
+        log_error(str(error))
+        backend = None
+        all_ok = False
+
+    if backend == "developer":
         log_success("GEMINI_API_KEY: configured")
-    else:
-        log_warning("GEMINI_API_KEY: not configured (required for --convert)")
+    elif backend == "vertex":
+        project = get_gcp_project()
+        if project:
+            log_success(f"Vertex AI: project={project}, location={get_gcp_location()}")
+        else:
+            log_error("GOOGLE_CLOUD_PROJECT: not configured")
+            all_ok = False
+        try:
+            import google.auth
+
+            credentials, _ = google.auth.default()
+            log_success(f"Application Default Credentials: {type(credentials).__name__}")
+        except Exception as error:
+            log_error(f"Application Default Credentials: unavailable ({error})")
+            all_ok = False
+
+        bucket = get_gcs_bucket()
+        if bucket:
+            if HAS_GCS:
+                log_success(f"GCS staging bucket: {normalize_bucket_name(bucket)}")
+            else:
+                log_error("google-cloud-storage is required for GCS staging")
+                all_ok = False
+        else:
+            log_warning("GCS staging is not configured; only small inline media can be sent")
     
     # Hardware
     processor = platform.processor()
@@ -386,8 +529,49 @@ def cmd_serve(port: int = 8000):
 # CONVERT MODE - FFPROBE
 # =============================================================================
 
+def pyav_check(video_path: Path) -> dict:
+    """Inspect media streams with PyAV when ffprobe is unavailable."""
+    if not HAS_PYAV:
+        return {}
+
+    try:
+        with av.open(str(video_path)) as container:
+            streams = list(container.streams)
+            duration = (
+                float(container.duration / av.time_base)
+                if container.duration is not None
+                else 0.0
+            )
+            has_subtitles = any(stream.type == "subtitle" for stream in streams)
+            has_audio = any(stream.type == "audio" for stream in streams)
+            stream_data = [
+                {
+                    "index": stream.index,
+                    "codec_type": stream.type,
+                    "codec_name": stream.codec_context.name,
+                }
+                for stream in streams
+            ]
+    except Exception as error:
+        log_error(f"PyAV media probe failed: {error}")
+        return {}
+
+    size_mb = get_file_size_mb(video_path)
+    log_success(
+        f"Duration: {duration:.1f}s, Size: {size_mb:.1f}MB, "
+        f"Audio: {has_audio}, Subtitles: {has_subtitles} (PyAV)"
+    )
+    return {
+        "duration": duration,
+        "size_mb": size_mb,
+        "has_audio": has_audio,
+        "has_subtitles": has_subtitles,
+        "data": {"streams": stream_data},
+    }
+
+
 def ffprobe_check(video_path: Path) -> dict:
-    """Check video health and get metadata."""
+    """Check media health and metadata with ffprobe or a PyAV fallback."""
     log_video(f"Checking video: {video_path.name}")
     
     cmd = [
@@ -399,6 +583,9 @@ def ffprobe_check(video_path: Path) -> dict:
     
     code, stdout, stderr = run_command(cmd)
     if code != 0:
+        if code == -1 and HAS_PYAV:
+            log_warning("ffprobe unavailable; using PyAV")
+            return pyav_check(video_path)
         log_error(f"ffprobe failed: {stderr}")
         return {}
     
@@ -455,6 +642,34 @@ def extract_subtitles(video_path: Path, output_path: Path) -> bool:
         return False
 
 
+def load_audio_with_pyav(video_path: Path, sample_rate: int = 16000):
+    """Decode the first audio stream to mono float32 samples for Whisper."""
+    if not HAS_PYAV:
+        raise RuntimeError("PyAV is not installed")
+
+    import numpy as np
+
+    chunks = []
+    with av.open(str(video_path)) as container:
+        if not container.streams.audio:
+            raise ValueError("media contains no audio stream")
+        stream = container.streams.audio[0]
+        resampler = av.audio.resampler.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=sample_rate,
+        )
+        for frame in container.decode(stream):
+            for output_frame in resampler.resample(frame):
+                chunks.append(output_frame.to_ndarray()[0])
+        for output_frame in resampler.resample(None):
+            chunks.append(output_frame.to_ndarray()[0])
+
+    if not chunks:
+        raise ValueError("media contains no decodable audio samples")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
 def transcribe_with_whisper(video_path: Path, output_path: Path) -> bool:
     """Transcribe video using mlx-whisper or whisper."""
     log_subtitle(f"Transcribing audio with Whisper...")
@@ -489,9 +704,18 @@ def transcribe_with_whisper(video_path: Path, output_path: Path) -> bool:
         log_info("Using openai-whisper")
         try:
             language = CONFIG.get("transcription", {}).get("language", "en")
+            model_name = CONFIG.get("transcription", {}).get("model", "base")
             log_info(f"Language: {language}")
-            model = whisper.load_model("base")
-            result = model.transcribe(str(video_path), language=language)
+            log_info(f"Model: {model_name}")
+            model = whisper.load_model(model_name)
+            if shutil.which("ffmpeg"):
+                result = model.transcribe(str(video_path), language=language)
+            elif HAS_PYAV:
+                log_warning("ffmpeg unavailable; decoding Whisper audio with PyAV")
+                audio = load_audio_with_pyav(video_path)
+                result = model.transcribe(audio, language=language)
+            else:
+                raise RuntimeError("Whisper requires ffmpeg or the PyAV fallback")
             
             with open(output_path, "w", encoding="utf-8") as vtt:
                 vtt.write("WEBVTT\n\n")
@@ -523,6 +747,10 @@ def downsample_video(video_path: Path, output_path: Path) -> Optional[Path]:
     if size_mb <= MAX_SIZE_MB:
         log_video(f"Video is {size_mb:.1f}MB - no downsampling needed")
         return video_path
+
+    if not shutil.which("ffmpeg"):
+        log_error("ffmpeg is required to downsample media over the configured limit")
+        return None
     
     log_video(f"Video is {size_mb:.1f}MB - downsampling to fit under {MAX_SIZE_MB}MB")
     
@@ -560,21 +788,28 @@ def downsample_video(video_path: Path, output_path: Path) -> Optional[Path]:
 # =============================================================================
 
 def call_gemini(
-    api_key: str,
     prompt_path: Path,
     subtitles_path: Path,
-    video_path: Path
+    video_path: Path,
+    client=None,
+    storage_client=None,
+    backend: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Optional[dict]:
     """
-    Call Gemini API to enhance subtitles.
+    Call Gemini to enhance subtitles using the selected backend.
+
+    The Developer API uses its managed Files service. Vertex AI uses a
+    tool-owned temporary GCS object when a staging bucket is configured, or
+    inline bytes for small media. Injected clients support offline tests.
     Returns dict with 'raw' (full response) and 'vtt' (extracted VTT) keys.
     """
     if not HAS_GENAI:
         log_error("google-genai not installed (pip install google-genai)")
         return None
-    
+
     log_ai(f"Calling Gemini ({GEMINI_MODEL})...")
-    
+
     # Read prompt
     with open(prompt_path, "r") as f:
         prompt_text = f.read()
@@ -593,11 +828,9 @@ def call_gemini(
     subtitle_tokens = len(subtitles_text) // 4
     video_tokens = int(video_size_mb * 1000)  # ~1000 tokens per MB
     total_input = prompt_tokens + subtitle_tokens + video_tokens
-    
+
     log_cost(f"Estimated input: ~{total_input:,} tokens")
-    
-    import time
-    
+
     # Build combined prompt
     full_prompt = f"""{prompt_text}
 
@@ -615,131 +848,113 @@ def call_gemini(
 
 The video file is attached. Please analyze it and generate the enhanced VTT.
 """
-    
+
+    api_key = api_key if api_key is not None else get_api_key()
+    uploaded_gcs = None
+    owns_client = client is None
     try:
-        if GENAI_NEW:
-            # New google.genai SDK
-            client = genai.Client(api_key=api_key)
-            
-            # Upload video file
-            log_ai("Uploading video to Gemini...")
+        selected_backend = backend or resolve_gemini_backend(api_key)
+        client = client or create_gemini_client(selected_backend, api_key)
+        mime_type = mimetypes.guess_type(video_path.name)[0]
+        if not mime_type:
+            log_error(f"Could not determine media MIME type: {video_path.name}")
+            return None
+
+        log_info(f"Gemini backend: {selected_backend}")
+
+        if selected_backend == "developer":
+            log_ai("Uploading media to the Gemini Files API...")
             video_file = client.files.upload(file=video_path)
-            
-            # Wait for processing
             while video_file.state.name == "PROCESSING":
-                log_info("Waiting for video processing...")
+                log_info("Waiting for media processing...")
                 time.sleep(5)
                 video_file = client.files.get(name=video_file.name)
-            
             if video_file.state.name == "FAILED":
-                log_error("Video processing failed")
-                return None
-            
-            log_success("Video uploaded and processed")
-            
-            # Wait for file propagation to avoid 404
-            log_info("Waiting 5s for file propagation...")
-            time.sleep(5)
-            
-            # Generate content
-            log_ai("Generating enhanced VTT...")
-            
-            # Prepare tools (Grounding)
-            tools = []
-            if CONFIG["gemini"]["grounding"]["enabled"]:
-                if CONFIG["gemini"]["grounding"]["source"] == "google_search":
-                    tools.append(types.Tool(google_search=types.GoogleSearch()))
-            
-            # Prepare config
-            gen_config = types.GenerateContentConfig(
-                temperature=CONFIG["gemini"]["temperature"],
-                max_output_tokens=CONFIG["gemini"]["max_output_tokens"],
-                tools=tools if tools else None
-            )
-
-            try:
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        types.Part.from_uri(file_uri=video_file.uri, mime_type=video_file.mime_type),
-                        full_prompt
-                    ],
-                    config=gen_config
-                )
-            except Exception as e:
-                # Catch 404 specifically
-                if "404" in str(e):
-                    log_error(f"Gemini returned 404 NOT_FOUND.")
-                    log_error(f"  Model: {GEMINI_MODEL}")
-                    log_error(f"  File URI: {video_file.uri}")
-                    log_error("This implies the model name is invalid or the file is not yet available.")
-                raise e
-            
-            # Extract text
-            text = response.text
-            
-            # Log usage if available
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                usage = response.usage_metadata
-                cost = estimate_cost(GEMINI_MODEL, usage.prompt_token_count, usage.candidates_token_count)
-                log_cost(f"Actual usage: {usage.prompt_token_count:,} input, {usage.candidates_token_count:,} output tokens (${cost:.4f})")
-        
-        else:
-            # Legacy google.generativeai SDK
-            genai.configure(api_key=api_key)
-            
-            # Upload video file
-            log_ai("Uploading video to Gemini...")
-            video_file = genai.upload_file(str(video_path))
-            
-            # Wait for processing
-            while video_file.state.name == "PROCESSING":
-                log_info("Waiting for video processing...")
+                raise RuntimeError("Gemini Files API media processing failed")
+            log_success("Media uploaded and processed")
+            if owns_client:
+                log_info("Waiting 5s for Gemini Files propagation...")
                 time.sleep(5)
-                video_file = genai.get_file(video_file.name)
-            
-            if video_file.state.name == "FAILED":
-                log_error("Video processing failed")
-                return None
-            
-            log_success("Video uploaded and processed")
-            
-            # Wait for propagation
-            log_info("Waiting 5s for file propagation...")
-            time.sleep(5)
-            
-            # Prepare tools (Grounding)
-            tools = []
-            if CONFIG["gemini"]["grounding"]["enabled"]:
-                if CONFIG["gemini"]["grounding"]["source"] == "google_search":
-                    tools.append({"google_search": {}})
+            media_part = types.Part.from_uri(
+                file_uri=video_file.uri,
+                mime_type=video_file.mime_type,
+            )
+        else:
+            bucket = get_gcs_bucket()
+            if bucket:
+                if not HAS_GCS and storage_client is None:
+                    raise RuntimeError(
+                        "google-cloud-storage is required for Vertex GCS staging"
+                    )
+                gcs = storage_client or storage.Client(project=get_gcp_project())
+                log_ai(f"Uploading media to GCS staging bucket ({mime_type})...")
+                gcs_uri, bucket_name, object_name = upload_media_to_gcs(
+                    video_path, mime_type, gcs
+                )
+                uploaded_gcs = (gcs, bucket_name, object_name)
+                log_success(f"Media staged at: {gcs_uri}")
+                media_part = types.Part.from_uri(
+                    file_uri=gcs_uri,
+                    mime_type=mime_type,
+                )
+            else:
+                inline_limit = float(
+                    CONFIG["gemini"].get("inline_max_size_mb", 15)
+                )
+                if video_size_mb > inline_limit:
+                    raise ValueError(
+                        f"Vertex inline media is limited to {inline_limit:g} MB by "
+                        "this configuration; set OPEN_VTT_GCS_BUCKET or "
+                        "gemini.gcs_bucket for larger media"
+                    )
+                log_ai(f"Sending small local media inline ({mime_type})...")
+                media_part = types.Part.from_bytes(
+                    data=video_path.read_bytes(),
+                    mime_type=mime_type,
+                )
 
-            # Create model with settings
-            model = genai.GenerativeModel(
-                model_name=GEMINI_MODEL,
-                generation_config={
-                    "temperature": CONFIG["gemini"]["temperature"],
-                    "max_output_tokens": CONFIG["gemini"]["max_output_tokens"],
-                },
-                tools=tools if tools else None
+        tools = []
+        if CONFIG["gemini"]["grounding"]["enabled"]:
+            if CONFIG["gemini"]["grounding"]["source"] == "google_search":
+                tools.append(types.Tool(google_search=types.GoogleSearch()))
+
+        gen_config = types.GenerateContentConfig(
+            temperature=CONFIG["gemini"]["temperature"],
+            max_output_tokens=CONFIG["gemini"]["max_output_tokens"],
+            tools=tools if tools else None,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
+
+        log_ai("Generating enhanced VTT...")
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[media_part, full_prompt],
+                config=gen_config,
             )
-            
-            # Generate content
-            log_ai("Generating enhanced VTT...")
-            response = model.generate_content(
-                [video_file, full_prompt],
-                request_options={"timeout": 600}
+        except Exception as error:
+            if "404" in str(error):
+                log_error("Gemini returned 404 NOT_FOUND.")
+                log_error(f"  Model: {GEMINI_MODEL}")
+                log_error("The configured model may not be available in this project.")
+            raise
+
+        text = response.text
+
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = response.usage_metadata
+            cost = estimate_cost(
+                GEMINI_MODEL,
+                usage.prompt_token_count,
+                usage.candidates_token_count,
             )
-            
-            # Extract text
-            text = response.text
-            
-            # Log usage if available
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                usage = response.usage_metadata
-                cost = estimate_cost(GEMINI_MODEL, usage.prompt_token_count, usage.candidates_token_count)
-                log_cost(f"Actual usage: {usage.prompt_token_count:,} input, {usage.candidates_token_count:,} output tokens (${cost:.4f})")
-        
+            log_cost(
+                f"Actual usage: {usage.prompt_token_count:,} input, "
+                f"{usage.candidates_token_count:,} output tokens (${cost:.4f})"
+            )
+
         # Keep full response for logging
         raw_text = text
         
@@ -761,10 +976,23 @@ The video file is attached. Please analyze it and generate the enhanced VTT.
             'raw': raw_text,
             'vtt': vtt_text
         }
-        
-    except Exception as e:
-        log_error(f"Gemini API error: {e}")
+
+    except Exception as error:
+        log_error(f"Gemini API error: {error}")
         return None
+    finally:
+        if uploaded_gcs is not None:
+            gcs, bucket_name, object_name = uploaded_gcs
+            try:
+                gcs.bucket(bucket_name).blob(object_name).delete()
+                log_info("Deleted temporary GCS media")
+            except Exception as error:
+                log_warning(
+                    f"Could not delete temporary GCS object "
+                    f"gs://{bucket_name}/{object_name}: {error}"
+                )
+        if owns_client and client is not None:
+            client.close()
 
 
 # =============================================================================
@@ -808,12 +1036,18 @@ def cmd_convert(video_file: str, output_vtt: Optional[str] = None):
     log_info(f"Input: {video_path}")
     log_info(f"Working Directory: {work_dir}")
     
-    # Check API key
+    # Resolve authentication before doing local media work.
     api_key = get_api_key()
-    if not api_key:
-        log_error("GEMINI_API_KEY not configured!")
-        log_info("Set environment variable or add to secrets.json")
+    try:
+        backend = resolve_gemini_backend(api_key)
+        if backend == "vertex" and not get_gcp_project():
+            raise ValueError(
+                "Vertex backend requires GOOGLE_CLOUD_PROJECT or gemini.project"
+            )
+    except ValueError as error:
+        log_error(str(error))
         sys.exit(1)
+    log_info(f"Gemini backend: {backend}")
     
     # Check prompt file
     prompt_path = Path(PROMPT_FILE)
@@ -865,7 +1099,13 @@ def cmd_convert(video_file: str, output_vtt: Optional[str] = None):
     
     # Step 4: Call Gemini
     print("\n" + "-" * 40)
-    result = call_gemini(api_key, prompt_path, subtitles_path, final_video)
+    result = call_gemini(
+        prompt_path,
+        subtitles_path,
+        final_video,
+        backend=backend,
+        api_key=api_key,
+    )
     
     if not result:
         log_error("Failed to generate enhanced VTT")

@@ -1,0 +1,4 @@
+av
+google-cloud-storage
+google-genai>=1.0.0
+openai-whisper

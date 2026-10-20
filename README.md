@@ -1,3 +1,103 @@
+# AMPAV fork additions
+
+The AMPAV fork preserves the original Gemini API-key workflow and adds a
+Vertex AI workflow authenticated with Google Application Default Credentials
+(ADC). Both workflows use `gemini-3.1-pro-preview` by default.
+
+### Deploy on a server
+
+1. Install FFmpeg and create an isolated Python environment:
+
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y ffmpeg python3-venv
+   git clone https://github.com/AMPAV/open-vtt.git
+   cd open-vtt
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   ```
+
+2. Configure the Vertex/ADC backend:
+
+   ```bash
+   export OPEN_VTT_GEMINI_BACKEND=vertex
+   export GOOGLE_CLOUD_PROJECT=YOUR_PROJECT_ID
+   export GOOGLE_CLOUD_LOCATION=global
+   export OPEN_VTT_GCS_BUCKET=YOUR_STAGING_BUCKET
+   export OPEN_VTT_GCS_PREFIX=open-vtt/staging
+   ```
+
+   On Google Cloud compute, prefer an attached service account. Elsewhere,
+   create user ADC as the same operating-system user that runs open-vtt:
+
+   ```bash
+   gcloud auth application-default login --no-launch-browser
+   ```
+
+   If the team provides an impersonatable service account, use short-lived
+   impersonated ADC instead of downloading a service-account JSON key:
+
+   ```bash
+   gcloud auth application-default login \
+     --impersonate-service-account=open-vtt-runner@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+     --no-launch-browser
+   ```
+
+   The ADC principal needs permission to call Vertex AI and create, read, and
+   delete objects in the staging bucket. `roles/aiplatform.user` on the project
+   and `roles/storage.objectUser` on the bucket provide the usual required
+   permissions. The user or group performing impersonation also needs
+   `roles/iam.serviceAccountTokenCreator` on the service account. The Vertex AI
+   and Cloud Storage APIs must be enabled. Store environment settings in the
+   server's service configuration rather than committing deployment-specific
+   values or credentials.
+
+3. Verify the deployment and start the player:
+
+   ```bash
+   .venv/bin/python open-vtt.py --check
+   .venv/bin/python open-vtt.py --serve --port 8000
+   ```
+
+   The first file without embedded subtitles downloads Whisper's approximately
+   139 MB `base` model into the service user's cache. The server therefore
+   needs outbound access and a writable cache directory for that first run.
+
+   A successful impersonated ADC login validates token creation only. Run both
+   `--check` and a conversion to confirm that the service account can call
+   Vertex AI and use the staging bucket.
+
+If a Gemini API key becomes available, set `GEMINI_API_KEY` and use
+`OPEN_VTT_GEMINI_BACKEND=developer`. That path uses the original Gemini Files
+API and does not require a GCS staging bucket. With backend `auto`, an API key
+is preferred when present; otherwise open-vtt uses Vertex AI with ADC.
+
+### Test large media
+
+Set the Vertex/ADC environment variables above and run:
+
+```bash
+.venv/bin/python open-vtt.py --convert /path/to/test-video.mp4
+```
+
+Use a 20–400 MB file to exercise GCS staging without FFmpeg downsampling. Use a
+file over 400 MB to also exercise the original FFmpeg downsampling cascade.
+The run should report the `vertex` backend, a temporary `gs://` staging URI,
+and successful deletion of that temporary object. The generated baseline VTT,
+full Gemini response log, and enhanced VTT are written beside the input media.
+Do not remove the input until those outputs have been reviewed.
+
+GCS avoids the inline request-size limit, but model limits still apply. Gemini
+3.1 Pro currently supports approximately 45 minutes of video with audio or one
+hour without audio. The tool deletes only the GCS object it creates; the local
+input is never deleted.
+
+---
+
+_The original upstream README begins below and is retained for reference. The
+AMPAV fork instructions above supersede its authentication, model, and
+installation details._
+
 # 🔆 open-vtt: AI-generated Extended Audio Descriptions
 
 _This project is archived / unsupported. For support with visual intelligence, see https://relantic.com_

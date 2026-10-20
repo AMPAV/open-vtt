@@ -1,6 +1,12 @@
 {
     "gemini": {
-        "model": "gemini-3-pro-preview",
+        "backend": "auto",
+        "project": null,
+        "location": "global",
+        "model": "gemini-3.1-pro-preview",
+        "gcs_bucket": null,
+        "gcs_prefix": "open-vtt/staging",
+        "inline_max_size_mb": 15,
         "temperature": 0.7,
         "max_output_tokens": 65536,
         "thinking": "high",
@@ -35,7 +41,8 @@
         ]
     },
     "transcription": {
-        "language": "en"
+        "language": "en",
+        "model": "base"
     },
     "files": {
         "prompt": "prompts/gemini_vtt_prompt.md"
