@@ -2,6 +2,85 @@
 
 _This project is archived / unsupported. For support with visual intelligence, see https://relantic.com_
 
+## AMPAV deployment and large-media testing
+
+The AMPAV fork preserves the original Gemini API-key workflow and adds a
+Vertex AI workflow authenticated with Google Application Default Credentials
+(ADC). Both workflows use `gemini-3.1-pro-preview` by default.
+
+### Brian: deploy on the AMPAV server
+
+1. Install FFmpeg and create an isolated Python environment:
+
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y ffmpeg python3-venv
+   git clone https://github.com/AMPAV/open-vtt.git
+   cd open-vtt
+   # Before merge only: git switch AMPAV-219
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   ```
+
+   Use branch `AMPAV-219` for pre-merge testing; use `main` after the change is
+   merged.
+
+2. Configure the server process. An attached service account is preferred. If
+   the server uses user ADC instead, run `gcloud auth application-default
+   login --no-launch-browser` as the same operating-system user that runs
+   open-vtt.
+
+   ```bash
+   export OPEN_VTT_GEMINI_BACKEND=vertex
+   export GOOGLE_CLOUD_PROJECT=bl-libr-ampav-dev
+   export GOOGLE_CLOUD_LOCATION=global
+   export OPEN_VTT_GCS_BUCKET=bl-libr-ampav-dev-ampav
+   export OPEN_VTT_GCS_PREFIX=open-vtt/staging
+   ```
+
+   The ADC principal needs permission to call Vertex AI and create, read, and
+   delete objects in the staging bucket. `roles/aiplatform.user` on the project
+   and `roles/storage.objectUser` on the bucket provide the usual required
+   permissions. The Vertex AI and Cloud Storage APIs must be enabled. Store
+   these environment settings in the server's service configuration rather
+   than committing deployment-specific values.
+
+3. Verify the deployment and start the player:
+
+   ```bash
+   .venv/bin/python open-vtt.py --check
+   .venv/bin/python open-vtt.py --serve --port 8000
+   ```
+
+   The first file without embedded subtitles downloads Whisper's approximately
+   139 MB `base` model into the service user's cache. The server therefore
+   needs outbound access and a writable cache directory for that first run.
+
+If a Gemini API key becomes available, set `GEMINI_API_KEY` and use
+`OPEN_VTT_GEMINI_BACKEND=developer`. That path uses the original Gemini Files
+API and does not require a GCS staging bucket. With backend `auto`, an API key
+is preferred when present; otherwise open-vtt uses Vertex AI with ADC.
+
+### Jon: test large media
+
+Set the Vertex/ADC environment variables above and run:
+
+```bash
+.venv/bin/python open-vtt.py --convert /path/to/test-video.mp4
+```
+
+Use a 20–400 MB file to exercise GCS staging without FFmpeg downsampling. Use a
+file over 400 MB to also exercise the original FFmpeg downsampling cascade.
+The run should report the `vertex` backend, a temporary `gs://` staging URI,
+and successful deletion of that temporary object. The generated baseline VTT,
+full Gemini response log, and enhanced VTT are written beside the input media.
+Do not remove the input until those outputs have been reviewed.
+
+GCS avoids the inline request-size limit, but model limits still apply. Gemini
+3.1 Pro currently supports approximately 45 minutes of video with audio or one
+hour without audio. The tool deletes only the GCS object it creates; the local
+input is never deleted.
+
 **open-vtt** is a robust AI-powered pipeline for generating **Extended Audio Descriptions (Extended AD)**, addressing a critical requirement for the upcoming regulatory and compliance targets for accessibility.
 
 It uses ffmpeg, Gemini, and Whisper to generate high-quality, accessible extended AD WebVTT subtitles that capture visual and semantic context.
@@ -39,9 +118,10 @@ We use Gemini for its multimodal capabilities, but we don't trust it blindly.
 - **Reasoning over Narratives**: The prompt instructs the model to reason frame-by-frame, ensuring that descriptions fill the *gaps* in dialogue without colliding with speech.
 
 ### 2. 🗂️ Handling File Limits
-Vertex AI accepts local media as inline request data. `open-vtt` handles the
-configured inline-media budget automatically:
-- **Smart Downsampling**: If your video is greater than the configured 7 MB default, it triggers an `ffmpeg` cascade.
+The Gemini Developer API uses its managed Files service. The Vertex AI backend
+stages larger local media in GCS and can send small files inline when no bucket
+is configured:
+- **Smart Downsampling**: If your video is greater than the configured 400 MB default, it triggers an `ffmpeg` cascade.
 - **Resolution Preservation**: It tries reducing both resolution and frame rate until it is allowed by the file size budget.
 
 ### 3. 🗣️ Robust Transcription Fallback
@@ -67,9 +147,10 @@ LLMs make mistakes. We reduce these by using native subtitles if available, grou
 
 ### Prerequisites
 - Python 3.9+
-- PyAV (`av`) for media probing and local Whisper decoding
-- `ffmpeg` on your PATH for embedded-subtitle extraction and video downsampling
-- Google Cloud Application Default Credentials (ADC) with Vertex AI access
+- `ffmpeg` and `ffprobe` on your PATH
+- A Gemini API key, or ADC with Vertex AI access
+- A GCS staging bucket for large media through the ADC/Vertex backend
+- PyAV (`av`) as a reduced-capability fallback when FFmpeg is unavailable
 
 ### Installation
 
@@ -80,11 +161,22 @@ LLMs make mistakes. We reduce these by using native subtitles if available, grou
    pip install mlx-whisper
    ```
 
-2. Configure ADC and select the Google Cloud project:
+2. Choose either the original API-key backend:
+
+   ```bash
+   cp secrets.example.json secrets.json
+   # Add the key to secrets.json, or export GEMINI_API_KEY instead.
+   export OPEN_VTT_GEMINI_BACKEND=developer
+   ```
+
+   Or configure the ADC/Vertex backend:
+
    ```bash
    gcloud auth application-default login
+   export OPEN_VTT_GEMINI_BACKEND=vertex
    export GOOGLE_CLOUD_PROJECT=your-project-id
    export GOOGLE_CLOUD_LOCATION=global
+   export OPEN_VTT_GCS_BUCKET=your-staging-bucket
    ```
 
 On Google Cloud compute, use the attached service account as ADC instead of
@@ -101,9 +193,10 @@ python open-vtt.py --convert video.mp4
 
 This will:
 1. Extract or Transcribe audio.
-2. Downsample video if needed for the configured inline-media budget.
-3. Send the local media inline to Gemini on Vertex AI for grounding and enhancement.
-4. Save `{video}.log` (full reasoning) and `{video}.vtt` (final file).
+2. Downsample video if needed (>400 MB by default).
+3. Upload the prepared media through Gemini Files or temporary GCS staging.
+4. Send the prepared media and baseline VTT to Gemini for grounding and enhancement.
+5. Save `{video}.log` (full reasoning) and `{video}.vtt` (final file).
 
 ### Player Mode
 
@@ -124,11 +217,15 @@ Tweak the model behavior in `config.json`:
 ```json
 {
     "gemini": {
+        "backend": "auto",
         "project": null,
         "location": "global",
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.1-pro-preview",
+        "gcs_bucket": null,
+        "gcs_prefix": "open-vtt/staging",
+        "inline_max_size_mb": 15,
         "temperature": 0.7,
-        "thinking": "high",   // "high" | "low"
+        "thinking": "high",
         "grounding": {
             "enabled": true,
             "source": "google_search"
@@ -146,7 +243,9 @@ Tweak the model behavior in `config.json`:
 python open-vtt.py --test
 ```
 
-Tests `to_vtt_time()`, VTT extraction, config loading, and path handling.
+Tests `to_vtt_time()`, VTT extraction, config loading, and path handling. The
+additional unit suite in `tests/` covers API-key, ADC/GCS, cleanup, and media
+fallback behavior without calling Gemini.
 
 ### JavaScript Tests
 Open the player in a browser and run in console:
