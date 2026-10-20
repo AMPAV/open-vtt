@@ -12,9 +12,9 @@ import argparse
 import datetime
 import http.server
 import json
+import mimetypes
 import os
 import platform
-import shutil
 import socketserver
 import subprocess
 import sys
@@ -41,14 +41,16 @@ def load_config():
     """Load configuration from config.json with sensible defaults."""
     config = {
         "gemini": {
-            "model": "gemini-3-pro-preview",
+            "project": None,
+            "location": "global",
+            "model": "gemini-2.5-flash",
             "temperature": 0.7,
             "max_output_tokens": 65536,
             "thinking": "high",
             "grounding": {"enabled": True, "source": "google_search"}
         },
         "video": {
-            "max_size_mb": 400,
+            "max_size_mb": 7,
             "downsample_targets": [
                 {"fps": 10, "resolution": "1920x1080", "label": "10fps 1080p"},
                 {"fps": 5,  "resolution": "1920x1080", "label": "5fps 1080p"},
@@ -57,7 +59,8 @@ def load_config():
             ]
         },
         "transcription": {
-            "language": "en"  # Whisper language code: en, de, fr, es, etc.
+            "language": "en",  # Whisper language code: en, de, fr, es, etc.
+            "model": "base",
         },
         "files": {
             "prompt": str(BASE_DIR / "prompts/gemini_vtt_prompt.md")
@@ -98,6 +101,13 @@ PROMPT_FILE = CONFIG["files"]["prompt"]
 HAS_MLX_WHISPER = False
 HAS_WHISPER = False
 HAS_GENAI = False
+HAS_PYAV = False
+
+try:
+    import av
+    HAS_PYAV = True
+except ImportError:
+    pass
 
 try:
     import mlx_whisper
@@ -115,14 +125,8 @@ try:
     from google import genai
     from google.genai import types
     HAS_GENAI = True
-    GENAI_NEW = True
 except ImportError:
-    try:
-        import google.generativeai as genai
-        HAS_GENAI = True
-        GENAI_NEW = False
-    except ImportError:
-        pass
+    pass
 
 # =============================================================================
 # UTILITIES
@@ -205,38 +209,43 @@ def to_vtt_time(seconds: float) -> str:
 
 
 # =============================================================================
-# API KEY HANDLING
+# GOOGLE CLOUD CONFIGURATION
 # =============================================================================
 
-def get_api_key() -> Optional[str]:
-    """Get Gemini API key from environment or secrets.json."""
-    # 1. Check environment variable
-    key = os.environ.get("GEMINI_API_KEY")
-    if key:
-        log_info("Using GEMINI_API_KEY from environment")
-        return key
-    
-    # 2. Check secrets.json
-    secrets_path = BASE_DIR / "secrets.json"
-    if secrets_path.exists():
-        try:
-            with open(secrets_path) as f:
-                secrets = json.load(f)
-                key = secrets.get("GEMINI_API_KEY")
-                if key and not key.startswith("YOUR_"):
-                    log_info("Using GEMINI_API_KEY from secrets.json")
-                    return key
-        except json.JSONDecodeError:
-            log_warning("secrets.json is not valid JSON")
-    
-    return None
+def get_gcp_project() -> Optional[str]:
+    """Return the Vertex AI project from the environment or config."""
+    return os.environ.get("GOOGLE_CLOUD_PROJECT") or CONFIG["gemini"].get("project")
+
+
+def get_gcp_location() -> str:
+    """Return the Vertex AI location from the environment or config."""
+    return (
+        os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or CONFIG["gemini"].get("location")
+        or "global"
+    )
+
+
+def create_gemini_client():
+    """Create a Vertex AI Gemini client authenticated with ADC."""
+    project = get_gcp_project()
+    if not project:
+        raise ValueError(
+            "Google Cloud project not configured; set GOOGLE_CLOUD_PROJECT "
+            "or gemini.project in config.json"
+        )
+    return genai.Client(
+        vertexai=True,
+        project=project,
+        location=get_gcp_location(),
+    )
 
 
 # =============================================================================
 # CHECK MODE
 # =============================================================================
 
-def check_command(name: str, cmd: list) -> bool:
+def check_command(name: str, cmd: list, *, required: bool = True) -> bool:
     """Check if a command is available."""
     code, stdout, stderr = run_command(cmd)
     if code == 0:
@@ -245,7 +254,10 @@ def check_command(name: str, cmd: list) -> bool:
         log_success(f"{name}: {version}")
         return True
     else:
-        log_error(f"{name}: not found")
+        if required:
+            log_error(f"{name}: not found")
+        else:
+            log_warning(f"{name}: not found")
         return False
 
 
@@ -255,9 +267,23 @@ def cmd_check():
     
     all_ok = True
     
-    # FFmpeg/FFprobe
-    all_ok &= check_command("ffmpeg", ["ffmpeg", "-version"])
-    all_ok &= check_command("ffprobe", ["ffprobe", "-version"])
+    # FFmpeg is optional for small inputs when PyAV is available, but remains
+    # necessary for embedded-subtitle extraction and video downsampling.
+    ffmpeg_available = check_command(
+        "ffmpeg", ["ffmpeg", "-version"], required=False
+    )
+    ffprobe_available = check_command(
+        "ffprobe", ["ffprobe", "-version"], required=False
+    )
+    if HAS_PYAV:
+        log_success("PyAV: available for media probing and Whisper decoding")
+    elif not ffprobe_available:
+        log_error("Media probing requires ffprobe or PyAV (pip install av)")
+        all_ok = False
+    if not ffmpeg_available:
+        log_warning(
+            "ffmpeg is required for embedded-subtitle extraction and downsampling"
+        )
     
     # Whisper
     if HAS_MLX_WHISPER:
@@ -270,19 +296,31 @@ def cmd_check():
     
     # Gemini SDK
     if HAS_GENAI:
-        if GENAI_NEW:
-            log_success("google-genai: available (new SDK)")
-        else:
-            log_warning("google-generativeai: available (legacy, recommend google-genai)")
+        log_success("google-genai: available")
     else:
         log_error("google-genai: not installed (pip install google-genai)")
         all_ok = False
-    
-    # API Key
-    if get_api_key():
-        log_success("GEMINI_API_KEY: configured")
+
+    # Vertex AI / ADC configuration
+    project = get_gcp_project()
+    if project:
+        log_success(
+            f"Vertex AI: project={project}, location={get_gcp_location()}"
+        )
     else:
-        log_warning("GEMINI_API_KEY: not configured (required for --convert)")
+        log_error("GOOGLE_CLOUD_PROJECT: not configured (required for --convert)")
+        all_ok = False
+
+    try:
+        import google.auth
+
+        credentials, _ = google.auth.default()
+        log_success(
+            f"Application Default Credentials: {type(credentials).__name__}"
+        )
+    except Exception as error:
+        log_error(f"Application Default Credentials: unavailable ({error})")
+        all_ok = False
     
     # Hardware
     processor = platform.processor()
@@ -386,8 +424,49 @@ def cmd_serve(port: int = 8000):
 # CONVERT MODE - FFPROBE
 # =============================================================================
 
+def pyav_check(video_path: Path) -> dict:
+    """Inspect media streams with PyAV when ffprobe is unavailable."""
+    if not HAS_PYAV:
+        return {}
+
+    try:
+        with av.open(str(video_path)) as container:
+            streams = list(container.streams)
+            duration = (
+                float(container.duration / av.time_base)
+                if container.duration is not None
+                else 0.0
+            )
+            has_subtitles = any(stream.type == "subtitle" for stream in streams)
+            has_audio = any(stream.type == "audio" for stream in streams)
+            stream_data = [
+                {
+                    "index": stream.index,
+                    "codec_type": stream.type,
+                    "codec_name": stream.codec_context.name,
+                }
+                for stream in streams
+            ]
+    except Exception as error:
+        log_error(f"PyAV media probe failed: {error}")
+        return {}
+
+    size_mb = get_file_size_mb(video_path)
+    log_success(
+        f"Duration: {duration:.1f}s, Size: {size_mb:.1f}MB, "
+        f"Audio: {has_audio}, Subtitles: {has_subtitles} (PyAV)"
+    )
+    return {
+        "duration": duration,
+        "size_mb": size_mb,
+        "has_audio": has_audio,
+        "has_subtitles": has_subtitles,
+        "data": {"streams": stream_data},
+    }
+
+
 def ffprobe_check(video_path: Path) -> dict:
-    """Check video health and get metadata."""
+    """Check media health and metadata with ffprobe or a PyAV fallback."""
     log_video(f"Checking video: {video_path.name}")
     
     cmd = [
@@ -399,6 +478,9 @@ def ffprobe_check(video_path: Path) -> dict:
     
     code, stdout, stderr = run_command(cmd)
     if code != 0:
+        if HAS_PYAV:
+            log_warning("ffprobe unavailable or failed; using PyAV")
+            return pyav_check(video_path)
         log_error(f"ffprobe failed: {stderr}")
         return {}
     
@@ -455,6 +537,34 @@ def extract_subtitles(video_path: Path, output_path: Path) -> bool:
         return False
 
 
+def load_audio_with_pyav(video_path: Path, sample_rate: int = 16000):
+    """Decode the first audio stream to mono float32 samples for Whisper."""
+    if not HAS_PYAV:
+        raise RuntimeError("PyAV is not installed")
+
+    import numpy as np
+
+    chunks = []
+    with av.open(str(video_path)) as container:
+        if not container.streams.audio:
+            raise ValueError("media contains no audio stream")
+        stream = container.streams.audio[0]
+        resampler = av.audio.resampler.AudioResampler(
+            format="s16",
+            layout="mono",
+            rate=sample_rate,
+        )
+        for frame in container.decode(stream):
+            for output_frame in resampler.resample(frame):
+                chunks.append(output_frame.to_ndarray()[0])
+        for output_frame in resampler.resample(None):
+            chunks.append(output_frame.to_ndarray()[0])
+
+    if not chunks:
+        raise ValueError("media contains no decodable audio samples")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
 def transcribe_with_whisper(video_path: Path, output_path: Path) -> bool:
     """Transcribe video using mlx-whisper or whisper."""
     log_subtitle(f"Transcribing audio with Whisper...")
@@ -489,9 +599,16 @@ def transcribe_with_whisper(video_path: Path, output_path: Path) -> bool:
         log_info("Using openai-whisper")
         try:
             language = CONFIG.get("transcription", {}).get("language", "en")
+            model_name = CONFIG.get("transcription", {}).get("model", "base")
             log_info(f"Language: {language}")
-            model = whisper.load_model("base")
-            result = model.transcribe(str(video_path), language=language)
+            log_info(f"Model: {model_name}")
+            model = whisper.load_model(model_name)
+            if HAS_PYAV:
+                log_info("Decoding audio with PyAV")
+                audio = load_audio_with_pyav(video_path)
+                result = model.transcribe(audio, language=language)
+            else:
+                result = model.transcribe(str(video_path), language=language)
             
             with open(output_path, "w", encoding="utf-8") as vtt:
                 vtt.write("WEBVTT\n\n")
@@ -560,21 +677,24 @@ def downsample_video(video_path: Path, output_path: Path) -> Optional[Path]:
 # =============================================================================
 
 def call_gemini(
-    api_key: str,
     prompt_path: Path,
     subtitles_path: Path,
-    video_path: Path
+    video_path: Path,
+    client=None,
 ) -> Optional[dict]:
     """
-    Call Gemini API to enhance subtitles.
+    Call Gemini on Vertex AI with ADC to enhance subtitles.
+
+    Local media is sent inline because the Gemini Files API is not available
+    through Vertex AI. ``client`` is injectable for offline tests.
     Returns dict with 'raw' (full response) and 'vtt' (extracted VTT) keys.
     """
     if not HAS_GENAI:
         log_error("google-genai not installed (pip install google-genai)")
         return None
-    
+
     log_ai(f"Calling Gemini ({GEMINI_MODEL})...")
-    
+
     # Read prompt
     with open(prompt_path, "r") as f:
         prompt_text = f.read()
@@ -593,11 +713,9 @@ def call_gemini(
     subtitle_tokens = len(subtitles_text) // 4
     video_tokens = int(video_size_mb * 1000)  # ~1000 tokens per MB
     total_input = prompt_tokens + subtitle_tokens + video_tokens
-    
+
     log_cost(f"Estimated input: ~{total_input:,} tokens")
-    
-    import time
-    
+
     # Build combined prompt
     full_prompt = f"""{prompt_text}
 
@@ -615,131 +733,65 @@ def call_gemini(
 
 The video file is attached. Please analyze it and generate the enhanced VTT.
 """
-    
+
+    owns_client = client is None
     try:
-        if GENAI_NEW:
-            # New google.genai SDK
-            client = genai.Client(api_key=api_key)
-            
-            # Upload video file
-            log_ai("Uploading video to Gemini...")
-            video_file = client.files.upload(file=video_path)
-            
-            # Wait for processing
-            while video_file.state.name == "PROCESSING":
-                log_info("Waiting for video processing...")
-                time.sleep(5)
-                video_file = client.files.get(name=video_file.name)
-            
-            if video_file.state.name == "FAILED":
-                log_error("Video processing failed")
-                return None
-            
-            log_success("Video uploaded and processed")
-            
-            # Wait for file propagation to avoid 404
-            log_info("Waiting 5s for file propagation...")
-            time.sleep(5)
-            
-            # Generate content
-            log_ai("Generating enhanced VTT...")
-            
-            # Prepare tools (Grounding)
-            tools = []
-            if CONFIG["gemini"]["grounding"]["enabled"]:
-                if CONFIG["gemini"]["grounding"]["source"] == "google_search":
-                    tools.append(types.Tool(google_search=types.GoogleSearch()))
-            
-            # Prepare config
-            gen_config = types.GenerateContentConfig(
-                temperature=CONFIG["gemini"]["temperature"],
-                max_output_tokens=CONFIG["gemini"]["max_output_tokens"],
-                tools=tools if tools else None
+        client = client or create_gemini_client()
+        mime_type = mimetypes.guess_type(video_path.name)[0]
+        if not mime_type:
+            log_error(f"Could not determine media MIME type: {video_path.name}")
+            return None
+
+        log_ai(f"Sending local media inline ({mime_type})...")
+
+        tools = []
+        if CONFIG["gemini"]["grounding"]["enabled"]:
+            if CONFIG["gemini"]["grounding"]["source"] == "google_search":
+                tools.append(types.Tool(google_search=types.GoogleSearch()))
+
+        gen_config = types.GenerateContentConfig(
+            temperature=CONFIG["gemini"]["temperature"],
+            max_output_tokens=CONFIG["gemini"]["max_output_tokens"],
+            tools=tools if tools else None,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
+        )
+
+        log_ai("Generating enhanced VTT...")
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Part.from_bytes(
+                        data=video_path.read_bytes(),
+                        mime_type=mime_type,
+                    ),
+                    full_prompt,
+                ],
+                config=gen_config,
+            )
+        except Exception as error:
+            if "404" in str(error):
+                log_error("Gemini returned 404 NOT_FOUND.")
+                log_error(f"  Model: {GEMINI_MODEL}")
+                log_error("The configured model may not be available in this project.")
+            raise
+
+        text = response.text
+
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            usage = response.usage_metadata
+            cost = estimate_cost(
+                GEMINI_MODEL,
+                usage.prompt_token_count,
+                usage.candidates_token_count,
+            )
+            log_cost(
+                f"Actual usage: {usage.prompt_token_count:,} input, "
+                f"{usage.candidates_token_count:,} output tokens (${cost:.4f})"
             )
 
-            try:
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        types.Part.from_uri(file_uri=video_file.uri, mime_type=video_file.mime_type),
-                        full_prompt
-                    ],
-                    config=gen_config
-                )
-            except Exception as e:
-                # Catch 404 specifically
-                if "404" in str(e):
-                    log_error(f"Gemini returned 404 NOT_FOUND.")
-                    log_error(f"  Model: {GEMINI_MODEL}")
-                    log_error(f"  File URI: {video_file.uri}")
-                    log_error("This implies the model name is invalid or the file is not yet available.")
-                raise e
-            
-            # Extract text
-            text = response.text
-            
-            # Log usage if available
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                usage = response.usage_metadata
-                cost = estimate_cost(GEMINI_MODEL, usage.prompt_token_count, usage.candidates_token_count)
-                log_cost(f"Actual usage: {usage.prompt_token_count:,} input, {usage.candidates_token_count:,} output tokens (${cost:.4f})")
-        
-        else:
-            # Legacy google.generativeai SDK
-            genai.configure(api_key=api_key)
-            
-            # Upload video file
-            log_ai("Uploading video to Gemini...")
-            video_file = genai.upload_file(str(video_path))
-            
-            # Wait for processing
-            while video_file.state.name == "PROCESSING":
-                log_info("Waiting for video processing...")
-                time.sleep(5)
-                video_file = genai.get_file(video_file.name)
-            
-            if video_file.state.name == "FAILED":
-                log_error("Video processing failed")
-                return None
-            
-            log_success("Video uploaded and processed")
-            
-            # Wait for propagation
-            log_info("Waiting 5s for file propagation...")
-            time.sleep(5)
-            
-            # Prepare tools (Grounding)
-            tools = []
-            if CONFIG["gemini"]["grounding"]["enabled"]:
-                if CONFIG["gemini"]["grounding"]["source"] == "google_search":
-                    tools.append({"google_search": {}})
-
-            # Create model with settings
-            model = genai.GenerativeModel(
-                model_name=GEMINI_MODEL,
-                generation_config={
-                    "temperature": CONFIG["gemini"]["temperature"],
-                    "max_output_tokens": CONFIG["gemini"]["max_output_tokens"],
-                },
-                tools=tools if tools else None
-            )
-            
-            # Generate content
-            log_ai("Generating enhanced VTT...")
-            response = model.generate_content(
-                [video_file, full_prompt],
-                request_options={"timeout": 600}
-            )
-            
-            # Extract text
-            text = response.text
-            
-            # Log usage if available
-            if hasattr(response, 'usage_metadata') and response.usage_metadata:
-                usage = response.usage_metadata
-                cost = estimate_cost(GEMINI_MODEL, usage.prompt_token_count, usage.candidates_token_count)
-                log_cost(f"Actual usage: {usage.prompt_token_count:,} input, {usage.candidates_token_count:,} output tokens (${cost:.4f})")
-        
         # Keep full response for logging
         raw_text = text
         
@@ -761,10 +813,13 @@ The video file is attached. Please analyze it and generate the enhanced VTT.
             'raw': raw_text,
             'vtt': vtt_text
         }
-        
-    except Exception as e:
-        log_error(f"Gemini API error: {e}")
+
+    except Exception as error:
+        log_error(f"Gemini API error: {error}")
         return None
+    finally:
+        if owns_client and client is not None:
+            client.close()
 
 
 # =============================================================================
@@ -808,11 +863,10 @@ def cmd_convert(video_file: str, output_vtt: Optional[str] = None):
     log_info(f"Input: {video_path}")
     log_info(f"Working Directory: {work_dir}")
     
-    # Check API key
-    api_key = get_api_key()
-    if not api_key:
-        log_error("GEMINI_API_KEY not configured!")
-        log_info("Set environment variable or add to secrets.json")
+    # Check Vertex AI configuration before doing local media work.
+    if not get_gcp_project():
+        log_error("Google Cloud project not configured!")
+        log_info("Set GOOGLE_CLOUD_PROJECT or gemini.project in config.json")
         sys.exit(1)
     
     # Check prompt file
@@ -865,7 +919,7 @@ def cmd_convert(video_file: str, output_vtt: Optional[str] = None):
     
     # Step 4: Call Gemini
     print("\n" + "-" * 40)
-    result = call_gemini(api_key, prompt_path, subtitles_path, final_video)
+    result = call_gemini(prompt_path, subtitles_path, final_video)
     
     if not result:
         log_error("Failed to generate enhanced VTT")

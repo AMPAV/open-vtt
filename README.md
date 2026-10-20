@@ -32,15 +32,16 @@ Standard AI captioning tools often fail to meet professional accessibility guide
 
 This tool is designed to work around the limitations of modern LLMs while maximizing their reasoning potential.
 
-### 1. 🧠 Intelligent Pipeline with Gemini Pro
-We use Gemini Pro for its multimodal capabilities, but we don't trust it blindly.
+### 1. 🧠 Intelligent Pipeline with Gemini
+We use Gemini for its multimodal capabilities, but we don't trust it blindly.
 - **Two-Pass Generation**: The prompt forces a "Chronological Event Log" pass first to stabilize the model's understanding of time, followed by the rigorous VTT generation pass.
 - **Grounding**: Uses Google Search to verify proper nouns, historical facts, and spelling (e.g., ensuring "Elijah Pierce" is spelled correctly based on context).
 - **Reasoning over Narratives**: The prompt instructs the model to reason frame-by-frame, ensuring that descriptions fill the *gaps* in dialogue without colliding with speech.
 
 ### 2. 🗂️ Handling File Limits
-Gemini API often has a file size limit for video uploads. `open-vtt` handles this automatically:
-- **Smart Downsampling**: If your video is greater than a limit, it triggers an `ffmpeg` cascade.
+Vertex AI accepts local media as inline request data. `open-vtt` handles the
+configured inline-media budget automatically:
+- **Smart Downsampling**: If your video is greater than the configured 7 MB default, it triggers an `ffmpeg` cascade.
 - **Resolution Preservation**: It tries reducing both resolution and frame rate until it is allowed by the file size budget.
 
 ### 3. 🗣️ Robust Transcription Fallback
@@ -66,23 +67,29 @@ LLMs make mistakes. We reduce these by using native subtitles if available, grou
 
 ### Prerequisites
 - Python 3.9+
-- `ffmpeg` installed and on your PATH
-- A Gemini API Key
+- PyAV (`av`) for media probing and local Whisper decoding
+- `ffmpeg` on your PATH for embedded-subtitle extraction and video downsampling
+- Google Cloud Application Default Credentials (ADC) with Vertex AI access
 
 ### Installation
 
-1. Copy the secrets template:
-   ```bash
-   cp secrets.example.json secrets.json
-   ```
-2. Add your API key to `secrets.json`.
-
-3. Install dependencies:
+1. Install the Python dependencies:
    ```bash
    pip install -r requirements.txt
    # For Mac users with Apple Silicon (High Performance):
    pip install mlx-whisper
    ```
+
+2. Configure ADC and select the Google Cloud project:
+   ```bash
+   gcloud auth application-default login
+   export GOOGLE_CLOUD_PROJECT=your-project-id
+   export GOOGLE_CLOUD_LOCATION=global
+   ```
+
+On Google Cloud compute, use the attached service account as ADC instead of
+running the interactive login command. The project and location can also be
+set as `gemini.project` and `gemini.location` in `config.json`.
 
 ### Conversion Mode
 
@@ -94,8 +101,8 @@ python open-vtt.py --convert video.mp4
 
 This will:
 1. Extract or Transcribe audio.
-2. Downsample video if needed (>400MB).
-3. Send to Gemini for grounding and enhancement.
+2. Downsample video if needed for the configured inline-media budget.
+3. Send the local media inline to Gemini on Vertex AI for grounding and enhancement.
 4. Save `{video}.log` (full reasoning) and `{video}.vtt` (final file).
 
 ### Player Mode
@@ -117,7 +124,9 @@ Tweak the model behavior in `config.json`:
 ```json
 {
     "gemini": {
-        "model": "gemini-3-pro-preview",
+        "project": null,
+        "location": "global",
+        "model": "gemini-2.5-flash",
         "temperature": 0.7,
         "thinking": "high",   // "high" | "low"
         "grounding": {

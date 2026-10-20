@@ -1,6 +1,8 @@
 {
     "gemini": {
-        "model": "gemini-3-pro-preview",
+        "project": null,
+        "location": "global",
+        "model": "gemini-2.5-flash",
         "temperature": 0.7,
         "max_output_tokens": 65536,
         "thinking": "high",
@@ -10,7 +12,7 @@
         }
     },
     "video": {
-        "max_size_mb": 400,
+        "max_size_mb": 7,
         "downsample_targets": [
             {
                 "fps": 10,
@@ -35,7 +37,8 @@
         ]
     },
     "transcription": {
-        "language": "en"
+        "language": "en",
+        "model": "base"
     },
     "files": {
         "prompt": "prompts/gemini_vtt_prompt.md"
